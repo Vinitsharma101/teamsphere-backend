@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -m py_compile app/main.py app/core/*.py app/db/*.py app/models/*.py app/schemas/*.py app/repositories/*.py app/services/*.py app/api/deps.py app/api/v1/*.py app/middleware/*.py alembic/env.py alembic/versions/0001_initial.py)",
+      "Bash(python -m py_compile app/main.py app/core/*.py app/db/*.py app/models/*.py app/schemas/*.py app/repositories/*.py app/services/*.py app/api/deps.py app/api/v1/*.py app/middleware/*.py alembic/env.py alembic/versions/0001_initial.py)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(venv/Scripts/python.exe *)"
+    ]
+  }
+}

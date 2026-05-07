@@ -1,0 +1,494 @@
+# TeamSphere Backend — Build Documentation
+
+A FastAPI + PostgreSQL project management backend built in 3 phases, going from a
+small CRUD prototype to an industry-level service with RBAC, cookie-based JWT,
+migrations, tests, and Docker deployment.
+
+================================================================================
+OVERVIEW
+================================================================================
+
+Stack:
+- FastAPI (web framework)
+- PostgreSQL (database)
+- SQLAlchemy 2.0 (ORM, modern Mapped style)
+- Alembic (database migrations)
+- Pydantic v2 + pydantic-settings (validation + config)
+- PyJWT (JSON Web Tokens)
+- passlib + bcrypt (password hashing)
+- slowapi (rate limiting)
+- pytest + httpx (testing)
+- Docker + docker-compose (deployment)
+
+Final layout:
+    app/
+    |-- api/
+    |   |-- deps.py                      auth + RBAC dependencies
+    |   `-- v1/
+    |       |-- auth.py                  signup/login/refresh/logout/me
+    |       |-- projects.py              project CRUD + transfer ownership
+    |       |-- project_members.py       member management + leave
+    |       |-- tasks.py                 task CRUD (nested + top-level)
+    |       `-- router.py                aggregates v1
+    |-- core/
+    |   |-- config.py                    Pydantic Settings (validated env)
+    |   |-- exceptions.py                custom errors + global handlers
+    |   |-- limiter.py                   slowapi limiter
+    |   |-- logging.py                   logging setup
+    |   `-- security.py                  hashing, JWT, cookie helpers
+    |-- db/
+    |   |-- base.py                      Base + TimestampMixin
+    |   `-- session.py                   engine + SessionLocal + get_db
+    |-- middleware/
+    |   |-- request_logging.py           request id + timing
+    |   `-- security_headers.py          CSP-adjacent headers
+    |-- models/
+    |   |-- user.py
+    |   |-- project.py
+    |   |-- project_member.py            ProjectRole enum, role_at_least()
+    |   `-- task.py                      TaskStatus + TaskPriority enums
+    |-- repositories/                    data access layer (one per model)
+    |-- schemas/                         Pydantic request/response models
+    |-- services/                        business logic (one per feature)
+    `-- main.py                          app factory
+    alembic/
+    |-- env.py
+    `-- versions/
+        |-- 0001_initial.py              users / projects / tasks
+        `-- 0002_team_collaboration.py   project_members + task FKs/enums
+    tests/
+    |-- conftest.py                      fixtures (engine, client, users)
+    |-- test_auth.py                     14 tests
+    |-- test_projects.py                 8 tests
+    |-- test_members.py                  11 tests
+    `-- test_tasks.py                    10 tests
+    Dockerfile
+    docker-compose.yml
+    .dockerignore
+    .env.example
+    pyproject.toml                       pytest + ruff config
+    requirements.txt                     prod deps
+    requirements-dev.txt                 pytest, ruff, httpx
+
+
+================================================================================
+STEP 1 - FOUNDATION REFACTOR
+================================================================================
+
+GOAL: Replace the prototype with a layered architecture, real ORM, migrations,
+proper config, and cookie-based JWT.
+
+What was BEFORE Step 1:
+- Raw mysql.connector queries scattered through route files.
+- SECRET_KEY = "key" hardcoded in source.
+- Bearer-token JWT in Authorization header (despite read.txt saying cookies).
+- No models, no services, no repos -- routes did everything.
+- No migrations; tables were created manually.
+- No request validation, no error handling, no logging.
+
+What CHANGED:
+
+1. New layered structure
+   routes -> services -> repositories -> models. Routes are now thin: they
+   parse input, call a service, return a response model. Services own the
+   transactions and business rules. Repositories own the queries.
+
+2. SQLAlchemy 2.0 (Mapped[] style) + Alembic
+   - app/db/base.py: Base + TimestampMixin (created_at / updated_at).
+   - app/db/session.py: engine with pool_pre_ping, pool_size=10, get_db().
+   - alembic/versions/0001_initial.py: creates users, projects, tasks with
+     proper indexes, FKs, ON DELETE CASCADE, server_default timestamps.
+
+3. PostgreSQL
+   - psycopg2-binary driver, postgresql+psycopg2:// URL built from settings.
+   - Mysql connector removed.
+
+4. Pydantic Settings (app/core/config.py)
+   - Required: SECRET_KEY (>=32 chars), DB_*.
+   - Validators normalize CORS_ORIGINS comma list and empty COOKIE_DOMAIN.
+   - .env.example committed; .env in .gitignore.
+   - Properties: database_url, is_production.
+
+5. Cookie-based JWT (app/core/security.py)
+   - Access token (15 min) + refresh token (7 d) -- separate types via "type"
+     claim so a refresh cookie cannot be used to authorize a request.
+   - Cookies are HttpOnly, Secure (in prod), SameSite (configurable).
+   - set_auth_cookies() / clear_auth_cookies() helpers.
+   - hash_password() / verify_password() via passlib bcrypt.
+   - jti UUID added in Step 3 so each issued token is unique.
+
+6. Centralized errors (app/core/exceptions.py)
+   - AppException hierarchy: NotFoundError, PermissionDeniedError,
+     AuthenticationError, ConflictError, ValidationError.
+   - Global handlers register on the app and convert exceptions, validation
+     errors, IntegrityError, SQLAlchemyError, and unhandled Exception into
+     a consistent JSON shape:
+        { "error": { "status": ..., "detail": ..., "path": ... } }
+
+7. Logging + request middleware (app/core/logging.py,
+   app/middleware/request_logging.py)
+   - One log line per request with method, path, status, duration, request id.
+   - X-Request-ID header echoed back to the client.
+
+8. Versioned router
+   All endpoints mounted under /api/v1.
+
+9. Auth endpoints implemented in cookie form
+   POST /api/v1/auth/signup
+   POST /api/v1/auth/login
+   POST /api/v1/auth/refresh    rotates both tokens using the refresh cookie
+   POST /api/v1/auth/logout
+   GET  /api/v1/auth/me
+
+   /me dependency: get_current_user() reads the access cookie, decodes,
+   loads the User, raises AuthenticationError if missing/invalid/inactive.
+
+10. /health endpoint (DB ping added in Step 3).
+
+Outcome of Step 1: clean separation of concerns, cookie auth that the frontend
+can use directly, validated config, real migrations.
+
+
+================================================================================
+STEP 2 - FEATURE COMPLETION (TEAM COLLABORATION + RBAC)
+================================================================================
+
+GOAL: Turn this from "single-user CRUD" into a team product: members, roles,
+project-scoped tasks, full CRUD, pagination, filters.
+
+DATA MODEL CHANGES:
+
+1. ProjectRole enum (admin / member / viewer) with a role_at_least() helper
+   based on a numeric ROLE_LEVEL map (viewer=1, member=2, admin=3).
+
+2. New table project_members
+   - id, project_id (FK), user_id (FK), role (string-stored enum), joined_at.
+   - UniqueConstraint(project_id, user_id) so a user can only be in a project
+     once.
+   - When a project is created, the creator is auto-inserted as ADMIN.
+
+3. Task model restructured
+   - Added project_id (FK, NOT NULL)  -- tasks now belong to projects.
+   - Added assigned_to (FK, nullable, ON DELETE SET NULL).
+   - Added priority (enum: low / medium / high / urgent).
+   - Renamed user_id -> created_by (still FK to users).
+   - status promoted from string to TaskStatus enum (todo / in_progress /
+     done / blocked).
+   - Indexes on project_id, assigned_to, created_by.
+
+4. Migration 0002_team_collaboration
+   - Creates project_members.
+   - Backfills existing projects: every project's creator becomes ADMIN.
+   - Adds the new task columns; renames user_id -> created_by.
+   - Auto-creates a "__inbox__" project for each user with orphan tasks so
+     project_id can be NOT NULL after backfill.
+   - Has a working downgrade().
+
+RBAC IMPLEMENTATION:
+
+5. require_project_role(min_role) dependency factory
+   (app/api/deps.py). Called like:
+
+       Depends(require_project_role(ProjectRole.ADMIN))
+
+   Behavior:
+   - Loads the project; 404 if not found.
+   - Looks up ProjectMember(project_id, current_user); 403 if not a member.
+   - Compares role to min_role via role_at_least(); 403 if insufficient.
+   - Returns the (Project, ProjectMember) tuple to the route.
+
+   This single dep is reused on every project-scoped endpoint.
+
+PERMISSION MATRIX:
+
+   Action                        Required role
+   ----------------------------- ------------------------------------
+   View project / members        viewer
+   List / view tasks             viewer
+   Create / edit tasks           member
+   Edit project metadata         admin
+   Manage members (add/remove)   admin
+   Delete project                admin AND project.created_by == user
+   Transfer ownership            admin AND project.created_by == user
+   Delete a task                 task.created_by == user OR admin
+
+   Special rules:
+   - Cannot demote the last remaining admin.
+   - Cannot demote / remove the project owner -- transfer first.
+   - Owner cannot leave -- transfer or delete.
+   - Assignee on a task must be a member of the project.
+
+NEW ENDPOINTS:
+
+   Method  Path                                      Min role
+   ------  ----------------------------------------  -----------------
+   POST    /projects                                 (auth)
+   GET     /projects                                 (auth) -- only projects you belong to
+   GET     /projects/{id}                            viewer
+   PATCH   /projects/{id}                            admin
+   DELETE  /projects/{id}                            admin + owner
+   POST    /projects/{id}/transfer                   admin + owner
+   GET     /projects/{id}/members                    viewer
+   POST    /projects/{id}/members                    admin
+   PATCH   /projects/{id}/members/{user_id}          admin
+   DELETE  /projects/{id}/members/{user_id}          admin
+   POST    /projects/{id}/leave                      viewer (self-action)
+   POST    /projects/{id}/tasks                      member
+   GET     /projects/{id}/tasks                      viewer (paginated + filtered)
+   GET     /tasks/{id}                               (membership inferred)
+   PATCH   /tasks/{id}                               (member of task's project)
+   DELETE  /tasks/{id}                               (creator OR admin)
+
+PAGINATION + FILTERING:
+
+6. PageParams and Page[T] in app/schemas/common.py.
+   GET /projects/{id}/tasks supports:
+
+       ?page=1&page_size=20      pagination (page_size capped at 100)
+       ?status=in_progress       TaskStatus filter
+       ?priority=high            TaskPriority filter
+       ?assigned_to=42           user id
+
+   Response shape:
+       {
+         "items": [...],
+         "total": 57,
+         "page": 1,
+         "page_size": 20,
+         "pages": 3
+       }
+
+7. Member management UX
+   Members are added by EMAIL (not user id), so admins can invite without
+   knowing the target's internal id. Lookup -> 404 if user not found,
+   409 if already a member.
+
+
+================================================================================
+STEP 3 - PRODUCTION HARDENING
+================================================================================
+
+GOAL: Make the service operate safely in production -- rate limits, security
+headers, real tests, container deployment, and clean docs.
+
+1. Rate limiting (slowapi)
+   - app/core/limiter.py: Limiter keyed on remote address, default
+     RATE_LIMIT_DEFAULT = 120/min.
+   - Per-endpoint limits (configurable via env):
+       signup   5/minute
+       login   10/minute
+       refresh 30/minute
+   - Toggle with RATE_LIMIT_ENABLED (set to false in tests).
+   - Custom 429 handler returns the standard error envelope.
+
+2. Security headers (app/middleware/security_headers.py)
+   Always set:
+       X-Content-Type-Options: nosniff
+       X-Frame-Options: DENY
+       Referrer-Policy: strict-origin-when-cross-origin
+       Permissions-Policy: geolocation=(), microphone=(), camera=()
+   In production also:
+       Strict-Transport-Security: max-age=63072000; includeSubDomains
+   Toggle with SECURITY_HEADERS_ENABLED.
+
+3. Token uniqueness
+   Each access/refresh token gets a jti (UUID4 hex) so two tokens issued
+   in the same second are still distinct. Foundation for future token
+   revocation lists.
+
+4. Health check
+   GET /health now executes "SELECT 1" against the DB and returns:
+       { "status": "ok|degraded", "env": ..., "database": "ok|error" }
+
+5. OpenAPI polish
+   - Tag descriptions for Auth / Projects / Project Members / Tasks / Health.
+   - Endpoint summaries on auth routes.
+   - Description shown on /docs landing.
+   - /docs and /redoc disabled when APP_ENV=production.
+
+6. Docker
+   - Dockerfile: python:3.12-slim, installs build-essential + libpq-dev for
+     psycopg2, runs as a non-root appuser, exposes 8000, includes a curl-
+     based HEALTHCHECK against /health.
+   - docker-compose.yml: api + postgres:16-alpine. Postgres has a
+     pg_isready healthcheck; api waits for it via depends_on.condition.
+     The api command runs "alembic upgrade head" before uvicorn so the
+     schema is always current.
+   - .dockerignore keeps tests, venv, .git, env files out of the image.
+
+7. Tests -- 43 passing in ~25s
+   - tests/conftest.py
+       * Sets test env vars before importing the app (SECRET_KEY,
+         RATE_LIMIT_ENABLED=false, etc.).
+       * Engine fixture: in-memory SQLite with StaticPool.
+       * Tables created via Base.metadata.create_all (no migrations).
+       * client fixture overrides get_db to use the SQLite session.
+       * auth_client fixture: a client that has signed up "alice@example.com"
+         and is already authenticated via cookies.
+       * make_user fixture: factory that inserts a user directly via the DB
+         session, returns the User object.
+
+   - test_auth.py (14)
+       signup happy path, duplicate email -> 409, invalid email -> 422,
+       short password -> 422, login OK / wrong password / unknown user,
+       me unauth / authed, refresh rotates cookies, refresh missing,
+       refresh with access token rejected, logout clears cookies,
+       /health.
+
+   - test_projects.py (8)
+       creator becomes admin, list returns only own projects,
+       non-member -> 403, update requires admin, admin can update,
+       only owner can delete, owner deletion works, 404 for missing.
+
+   - test_members.py (11)
+       add by email, unknown email -> 404, duplicate -> 409,
+       only admin can add, role update, last-admin protection,
+       remove member, cannot remove owner, member can leave,
+       owner cannot leave, transfer ownership.
+
+   - test_tasks.py (10)
+       create task, viewer cannot create, non-member 403 on list,
+       pagination + priority filter, status update,
+       assignee must be member -> 422, assign valid member,
+       creator can delete own, member cannot delete others',
+       admin can delete any task in project.
+
+8. Dev tooling
+   - pyproject.toml: pytest config (testpaths=tests, strict markers) and
+     ruff config (line length 100, py312 target, common rule sets).
+   - requirements-dev.txt extends requirements.txt with pytest, pytest-cov,
+     httpx, ruff.
+
+
+================================================================================
+RUNNING THE PROJECT
+================================================================================
+
+Local development:
+
+    1. Copy env:
+         cp .env.example .env
+         # set SECRET_KEY (>=32 chars), DB_*, CORS_ORIGINS
+
+    2. Install deps:
+         pip install -r requirements-dev.txt
+
+    3. Apply migrations:
+         alembic upgrade head
+
+    4. Run:
+         uvicorn app.main:app --reload
+
+    5. Tests:
+         pytest                       # 43 tests, ~25s
+         pytest --cov=app             # with coverage
+
+Docker:
+
+    docker compose up --build
+
+    -- builds the api image
+    -- starts postgres:16-alpine with healthcheck
+    -- runs alembic upgrade head, then uvicorn
+    -- API available on http://localhost:8000
+    -- Swagger UI at /docs (disabled in production)
+
+
+================================================================================
+KEY DESIGN DECISIONS / WHY
+================================================================================
+
+* Cookie JWT, not Bearer
+  The frontend (Vercel) and API can be on different origins. HttpOnly
+  cookies with SameSite + Secure protect against XSS token theft, and
+  the refresh-token rotation pattern lets short-lived access tokens
+  expire frequently without UX pain.
+
+* Separate "type" claim on access vs refresh
+  decode_token(token, expected_type=...) refuses to accept a refresh
+  token where an access token is required (and vice versa). This blocks
+  the trivial swap attack you'd otherwise have to remember to defend.
+
+* Repositories own queries, services own transactions
+  Routes never see SQL. Services call self.db.commit() once per use
+  case. Repositories only flush() so the service controls atomicity.
+
+* String-stored enums (native_enum=False)
+  Easier to evolve enum values across PG and SQLite (used in tests)
+  without ALTER TYPE migrations. Trade-off: slightly weaker DB-level
+  validation, but Pydantic enforces it at the API boundary.
+
+* RBAC as a dep factory, not a decorator
+  Depends(require_project_role(ProjectRole.ADMIN)) keeps the role visible
+  in the route signature and makes the (Project, ProjectMember) tuple
+  available to the handler -- no second lookup needed.
+
+* SQLite in tests, PostgreSQL in prod
+  Tests use Base.metadata.create_all on an in-memory SQLite, which means
+  the test suite runs in seconds with no external dependencies. The
+  schema differences are bridged by string-stored enums and standard
+  column types in the migration.
+
+* "__inbox__" auto-project in migration 0002
+  Required because tasks now have project_id NOT NULL, but pre-existing
+  tasks have no project. We give each affected user an "__inbox__"
+  project so the migration is non-destructive.
+
+
+================================================================================
+FRONTEND INTEGRATION NOTES
+================================================================================
+
+* Always send credentials: include cookies on every request
+  fetch("...", { credentials: "include" })
+
+* CORS: backend's CORS_ORIGINS must include the frontend origin and
+  allow_credentials=True is already set.
+
+* Auth flow:
+    1. POST /auth/signup or /auth/login -> cookies set, body has user info
+    2. Subsequent requests carry the access cookie automatically
+    3. On 401, call POST /auth/refresh; on success retry the original
+       request; on failure redirect to login
+    4. POST /auth/logout to clear cookies
+
+* Pagination response: {items, total, page, page_size, pages}.
+  Use total / page_size to render page controls; pages is precomputed.
+
+* Errors: every error response is shaped
+  { "error": { "status": int, "detail": str|list, "path": str } }
+
+
+================================================================================
+WHAT'S DONE vs WHAT'S NEXT
+================================================================================
+
+DONE (3 steps):
+[x] Cookie-based JWT auth (access + refresh)
+[x] Layered architecture (routes / services / repos / models)
+[x] PostgreSQL + SQLAlchemy 2.0 + Alembic
+[x] Project members + RBAC (admin/member/viewer)
+[x] Project-scoped tasks with status, priority, assignee
+[x] Full CRUD on projects, tasks, members
+[x] Transfer ownership, leave project
+[x] Pagination + filtering
+[x] Centralized error handling
+[x] Request logging + X-Request-ID
+[x] Rate limiting on auth endpoints
+[x] Security headers
+[x] /health with DB check
+[x] OpenAPI polish
+[x] Dockerfile + docker-compose
+[x] 43 passing tests covering auth, RBAC, CRUD, edge cases
+
+POSSIBLE FUTURE WORK (not part of the 3 steps):
+[ ] Email verification + password reset flow
+[ ] Token revocation list (jti is already in place)
+[ ] Project invitations with accept/decline (current flow is direct add)
+[ ] File attachments on tasks
+[ ] Comments / activity feed per task
+[ ] WebSocket / SSE for real-time updates
+[ ] Audit log for sensitive actions
+[ ] Background jobs (Celery / Arq) for emails, reminders
+[ ] Account lockout after N failed logins (rate limit covers this partially)
+[ ] CI workflow (GitHub Actions: lint + tests + docker build)
