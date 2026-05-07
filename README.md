@@ -366,14 +366,6 @@ This backend was built to demonstrate:
 * Clean code separation
 * Testing strategies
 
----
-
-# License
-
-MIT License
-
----
-
 # Author
 
 Built with FastAPI, PostgreSQL, and modern backend engineering practices.
